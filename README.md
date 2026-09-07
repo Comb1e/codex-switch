@@ -73,13 +73,13 @@ key remain in the profile store.
 The effective provider configuration is:
 
 ~~~toml
-model_provider = "OpenAI"
+model_provider = "codex_switch_relay"
 disable_response_storage = true
 network_access = "enabled"
 windows_wsl_setup_acknowledged = true
 
-[model_providers.OpenAI]
-name = "OpenAI"
+[model_providers.codex_switch_relay]
+name = "Codex Switch Relay"
 base_url = "http://127.0.0.1:14556/"
 wire_api = "responses"
 requires_openai_auth = true
@@ -95,7 +95,10 @@ while requires_openai_auth = true would send the ChatGPT bearer token instead of
 the relay API key.
 
 Unrelated TOML settings, tables, and comments are preserved. Conflicting fields
-inside [model_providers.OpenAI] are replaced.
+inside [model_providers.codex_switch_relay] are replaced. The legacy
+[model_providers.OpenAI] table from codex-switch 0.2.0 is removed because
+`openai` is a reserved built-in provider ID and provider IDs are normalized
+case-insensitively by Codex.
 
 ## Profile commands
 

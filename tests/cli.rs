@@ -99,13 +99,16 @@ fn add_switch_list_current_and_external_edit() {
         .unwrap()
         .parse()
         .unwrap();
-    assert_eq!(config["model_provider"].as_str(), Some("OpenAI"));
     assert_eq!(
-        config["model_providers"]["OpenAI"]["base_url"].as_str(),
+        config["model_provider"].as_str(),
+        Some("codex_switch_relay")
+    );
+    assert_eq!(
+        config["model_providers"]["codex_switch_relay"]["base_url"].as_str(),
         Some("http://127.0.0.1:14556/")
     );
     assert_eq!(
-        config["model_providers"]["OpenAI"]["requires_openai_auth"].as_bool(),
+        config["model_providers"]["codex_switch_relay"]["requires_openai_auth"].as_bool(),
         Some(true)
     );
     assert_eq!(config["disable_response_storage"].as_bool(), Some(true));

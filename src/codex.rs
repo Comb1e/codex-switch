@@ -7,6 +7,8 @@ use toml_edit::{DocumentMut, Item, Table, value};
 use crate::relay::{PROVIDER_ID, base_url};
 
 const WIRE_API: &str = "responses";
+const PROVIDER_NAME: &str = "Codex Switch Relay";
+const LEGACY_PROVIDER_ID: &str = "OpenAI";
 
 pub fn prepare(original_config: Option<&[u8]>) -> Result<Vec<u8>> {
     let mut config = parse_config(original_config)?;
@@ -16,8 +18,15 @@ pub fn prepare(original_config: Option<&[u8]>) -> Result<Vec<u8>> {
     set_toml_bool(&mut config, "windows_wsl_setup_acknowledged", true);
     config.remove("openai_base_url");
 
+    if let Some(providers) = config
+        .get_mut("model_providers")
+        .and_then(Item::as_table_like_mut)
+    {
+        providers.remove(LEGACY_PROVIDER_ID);
+    }
+
     config["model_providers"][PROVIDER_ID] = Item::Table(Table::new());
-    config["model_providers"][PROVIDER_ID]["name"] = value(PROVIDER_ID);
+    config["model_providers"][PROVIDER_ID]["name"] = value(PROVIDER_NAME);
     config["model_providers"][PROVIDER_ID]["base_url"] = value(base_url());
     config["model_providers"][PROVIDER_ID]["wire_api"] = value(WIRE_API);
     config["model_providers"][PROVIDER_ID]["requires_openai_auth"] = value(true);
@@ -51,7 +60,7 @@ pub fn matches_bytes(config: &[u8]) -> bool {
         && toml_bool(&document, "disable_response_storage") == Some(true)
         && toml_string(&document, "network_access") == Some("enabled")
         && toml_bool(&document, "windows_wsl_setup_acknowledged") == Some(true)
-        && document["model_providers"][PROVIDER_ID]["name"].as_str() == Some(PROVIDER_ID)
+        && document["model_providers"][PROVIDER_ID]["name"].as_str() == Some(PROVIDER_NAME)
         && document["model_providers"][PROVIDER_ID]["base_url"].as_str()
             == Some(base_url().as_str())
         && document["model_providers"][PROVIDER_ID]["wire_api"].as_str() == Some(WIRE_API)
@@ -116,18 +125,25 @@ mod tests {
         assert!(text.contains("model = \"gpt-test\" # keep"));
         assert!(text.contains("web_search = true"));
         assert!(!text.contains("openai_base_url"));
+        assert!(text.contains("model_provider = \"codex_switch_relay\""));
+        assert!(text.contains("name = \"Codex Switch Relay\""));
         assert!(text.contains("base_url = \"http://127.0.0.1:14556/\""));
         assert!(matches_bytes(&prepared));
     }
 
     #[test]
-    fn replaces_conflicting_provider_auth_fields() {
+    fn removes_reserved_legacy_provider_and_replaces_conflicting_auth_fields() {
         let config = br#"[model_providers.OpenAI]
+base_url = "https://legacy.example.test/v1"
+
+[model_providers.codex_switch_relay]
 env_key = "SHOULD_BE_REMOVED"
 requires_openai_auth = false
 "#;
         let prepared = prepare(Some(config)).unwrap();
         let text = String::from_utf8(prepared).unwrap();
+        assert!(!text.contains("[model_providers.OpenAI]"));
+        assert!(!text.contains("legacy.example.test"));
         assert!(!text.contains("SHOULD_BE_REMOVED"));
         assert!(text.contains("requires_openai_auth = true"));
     }

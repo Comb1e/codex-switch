@@ -16,7 +16,7 @@ use crate::profile::ProfileStore;
 
 pub const RELAY_HOST: &str = "127.0.0.1";
 pub const RELAY_PORT: u16 = 14556;
-pub const PROVIDER_ID: &str = "OpenAI";
+pub const PROVIDER_ID: &str = "codex_switch_relay";
 
 const HEALTH_PATH: &str = "/__codex_switch_health";
 const HEALTH_MARKER: &str = "codex-switch-relay";
