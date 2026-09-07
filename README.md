@@ -1,12 +1,18 @@
-# cs
+# codex-switch
 
-`cs` is a small Windows and Linux command-line tool for saving and switching named
-Codex API endpoint and API-key profiles.
+cs lets Codex Desktop stay signed in with a ChatGPT account while model
+requests use a separate relay API key.
 
-It updates the user-level Codex files documented in the official OpenAI
-[configuration reference](https://developers.openai.com/codex/config-reference)
-and [authentication guide](https://developers.openai.com/codex/auth). Existing
-unrelated `config.toml` settings, comments, and `auth.json` fields are preserved.
+Codex has one shared authentication cache. Switching that cache to
+auth_mode = "apikey" makes the desktop app stop treating the ChatGPT login as
+active. cs avoids that conflict:
+
+1. Codex keeps the ChatGPT tokens in auth.json.
+2. Codex sends model requests to a loopback-only relay at 127.0.0.1:14556.
+3. The relay replaces the ChatGPT Authorization header with the API key from
+   the active cs profile, then forwards the request to the configured upstream.
+
+The relay never sends the ChatGPT access token to the upstream server.
 
 ## Install
 
@@ -14,91 +20,130 @@ Rust and Cargo are required to build from source.
 
 PowerShell:
 
-```powershell
+~~~powershell
 .\install.ps1
-```
+~~~
 
 Bash:
 
-```bash
+~~~bash
 ./install.sh
-```
+~~~
 
-Both scripts run `cargo install --path <repository> --force`. If `cs` is not found
-after installation, add Cargo's bin directory to `PATH` (`$HOME/.cargo/bin` on
-Linux or `%USERPROFILE%\.cargo\bin` on Windows).
+Both scripts run cargo install --path <repository> --force. If cs is not found
+afterward, add Cargo's bin directory to PATH (%USERPROFILE%\.cargo\bin on
+Windows or $HOME/.cargo/bin on Linux).
 
-## Usage
+## Configure the relay
 
-Save a profile and activate it:
+Save the relay key without echoing it in the terminal, then activate the profile:
 
-```powershell
-# PowerShell
-cs add --name work --baseurl "https://proxy.example.com/v1" --apikey "$env:OPENAI_API_KEY"
-cs work
-```
+~~~powershell
+$env:RELAY_API_KEY | cs add --name transit --baseurl "http://154.201.72.176:8080/" --apikey-stdin
+cs transit
+~~~
 
-```bash
-# Bash
-cs add --name work --baseurl "https://proxy.example.com/v1" --apikey "$OPENAI_API_KEY"
-cs work
-```
+For the migration sequence where the relay key is currently stored in
+auth.json, close Codex Desktop and run:
 
-For less exposure through process arguments, pipe the key through standard input:
+~~~powershell
+.\enable-relay.ps1
+~~~
 
-```powershell
-$env:OPENAI_API_KEY | cs add --name work --baseurl "https://proxy.example.com/v1" --apikey-stdin
-```
+The script imports that key into the transit profile without displaying it. It
+does not modify auth.json. Replace auth.json with your ChatGPT login file after
+the script completes.
 
-```bash
-printf '%s' "$OPENAI_API_KEY" | cs add --name work --baseurl "https://proxy.example.com/v1" --apikey-stdin
-```
+Activation stops the currently managed relay, updates ~/.codex/config.toml,
+starts a fresh background relay for the selected profile, and registers
+CodexSwitchRelay under the current user's Windows startup entries. It does not
+create, edit, or delete ~/.codex/auth.json.
 
-When neither `--apikey` nor `--apikey-stdin` is supplied in an interactive
-terminal, `cs` prompts for the key without echoing it.
+After activation, place the ChatGPT login file produced by
+[codex-auth-helper](https://github.com/zhishile/codex-auth-helper) at
+~/.codex/auth.json, or use Codex's normal ChatGPT login. Close and reopen Codex
+Desktop after changing the configuration or authentication file.
 
-Other commands:
+The relay starts automatically when the same Windows user next signs in. The
+startup command contains only the cs executable path; the upstream URL and API
+key remain in the profile store.
 
-```text
+## Generated Codex configuration
+
+The effective provider configuration is:
+
+~~~toml
+model_provider = "OpenAI"
+disable_response_storage = true
+network_access = "enabled"
+windows_wsl_setup_acknowledged = true
+
+[model_providers.OpenAI]
+name = "OpenAI"
+base_url = "http://127.0.0.1:14556/"
+wire_api = "responses"
+requires_openai_auth = true
+
+[features]
+goals = true
+remote_compaction_v2 = true
+~~~
+
+The provider base_url intentionally points to the local relay. The real upstream
+URL remains in the selected profile. Pointing Codex directly at the upstream
+while requires_openai_auth = true would send the ChatGPT bearer token instead of
+the relay API key.
+
+Unrelated TOML settings, tables, and comments are preserved. Conflicting fields
+inside [model_providers.OpenAI] are replaced.
+
+## Profile commands
+
+~~~text
+cs add --name NAME --baseurl URL --apikey KEY
+cs add --name NAME --baseurl URL --apikey-stdin
+cs NAME
 cs list
 cs current
-cs remove work
-cs remove work --force
+cs remove NAME
+cs remove NAME --force
 cs --help
 cs --version
-```
+~~~
 
-Adding an existing name requires `--force`. Overwriting an active profile clears
-its active marker until it is activated again. Removing an active profile also
-requires `--force`; this removes only the saved profile and leaves the currently
-applied Codex files unchanged.
+Adding an existing name requires --force. Removing an active profile also
+requires --force.
+
+Every cs NAME activation restarts the managed relay, so the newly selected base
+URL and API key take effect immediately in the proxy. Restart Codex Desktop
+after switching so it reloads config.toml.
 
 ## Files and security
 
-Profiles are stored in `%LOCALAPPDATA%\cs\profiles.json` on Windows and
-`${XDG_CONFIG_HOME:-~/.config}/cs/profiles.json` on Linux. `CODEX_HOME` selects
-the Codex directory and defaults to `~/.codex`.
+Profiles are stored in %LOCALAPPDATA%\cs\profiles.json on Windows and
+${XDG_CONFIG_HOME:-~/.config}/cs/profiles.json on Linux. CODEX_HOME selects the
+Codex directory and defaults to ~/.codex.
 
-API keys are deliberately stored as plaintext, as they are in Codex's file-backed
-`auth.json`. Treat both files as secrets. On Linux, `cs` creates its data
-directory with mode `0700` and secret files with mode `0600`. On Windows, files
-inherit the ACL of the user's local application-data directory.
+API keys are stored as plaintext in the profile store. On Linux, cs creates the
+data directory with mode 0700 and the profile store with mode 0600. On Windows,
+files inherit the ACL of the user's local application-data directory. Relay logs
+contain errors only, not request bodies or authorization headers.
 
-Activation uses atomic file replacement and rollback. It sets these Codex values:
+The configured upstream in the example uses plain HTTP. API keys, prompts, tool
+outputs, and responses are not encrypted between the local relay and that
+server. Use HTTPS when the relay service supports it.
 
-```toml
-model_provider = "openai"
-openai_base_url = "https://proxy.example.com/v1"
-cli_auth_credentials_store = "file"
-```
-
-It also sets `auth_mode` to `apikey` and updates `OPENAI_API_KEY` in `auth.json`.
-Already-running Codex processes must be restarted to read the new settings.
+Codex's official
+[authentication guide](https://developers.openai.com/codex/auth) documents that
+requires_openai_auth = true can use ChatGPT authentication with a custom
+provider. The
+[configuration reference](https://developers.openai.com/codex/config-reference)
+documents the provider fields used here.
 
 ## Development
 
-```bash
+~~~bash
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
-```
+~~~

@@ -26,6 +26,9 @@ enum Command {
     Current,
     /// Remove a saved profile.
     Remove(RemoveArgs),
+    /// Internal command used by the local relay process.
+    #[command(name = "__relay", hide = true)]
+    Relay,
     /// A profile name may be used directly, for example: cs work
     #[command(external_subcommand)]
     Profile(Vec<OsString>),
@@ -80,6 +83,7 @@ pub enum Action {
     Activate {
         name: String,
     },
+    Relay,
 }
 
 impl Cli {
@@ -97,6 +101,7 @@ impl Cli {
                 name: args.name,
                 force: args.force,
             }),
+            Some(Command::Relay) => Ok(Action::Relay),
             Some(Command::Profile(parts)) => {
                 if parts.len() != 1 {
                     bail!("activation accepts exactly one profile name");

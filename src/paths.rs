@@ -10,7 +10,8 @@ pub struct AppPaths {
     pub lock_file: PathBuf,
     pub codex_home: PathBuf,
     pub config_file: PathBuf,
-    pub auth_file: PathBuf,
+    pub relay_stdout_file: PathBuf,
+    pub relay_stderr_file: PathBuf,
 }
 
 impl AppPaths {
@@ -40,8 +41,9 @@ impl AppPaths {
         Ok(Self {
             store_file: store_dir.join("profiles.json"),
             lock_file: store_dir.join(".lock"),
+            relay_stdout_file: store_dir.join("relay.stdout.log"),
+            relay_stderr_file: store_dir.join("relay.stderr.log"),
             config_file: codex_home.join("config.toml"),
-            auth_file: codex_home.join("auth.json"),
             codex_home,
         })
     }
@@ -53,8 +55,9 @@ impl AppPaths {
         Self {
             store_file: store_dir.join("profiles.json"),
             lock_file: store_dir.join(".lock"),
+            relay_stdout_file: store_dir.join("relay.stdout.log"),
+            relay_stderr_file: store_dir.join("relay.stderr.log"),
             config_file: codex_home.join("config.toml"),
-            auth_file: codex_home.join("auth.json"),
             codex_home,
         }
     }

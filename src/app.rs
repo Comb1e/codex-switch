@@ -9,19 +9,29 @@ use crate::cli::Action;
 use crate::codex;
 use crate::paths::AppPaths;
 use crate::profile::{Profile, ProfileStore};
+use crate::relay::{self, RelayManager};
 use crate::validation::{validate_api_key, validate_base_url, validate_name};
 
-pub struct App<W> {
+pub struct App<W, R> {
     paths: AppPaths,
     writer: W,
+    relay: R,
 }
 
-impl<W: FileWriter> App<W> {
-    pub fn new(paths: AppPaths, writer: W) -> Self {
-        Self { paths, writer }
+impl<W: FileWriter, R: RelayManager> App<W, R> {
+    pub fn new(paths: AppPaths, writer: W, relay: R) -> Self {
+        Self {
+            paths,
+            writer,
+            relay,
+        }
     }
 
     pub fn execute(&self, action: Action) -> Result<String> {
+        if let Action::Relay = action {
+            relay::serve(self.paths.clone())?;
+            return Ok(String::new());
+        }
         let _lock = LockGuard::acquire(&self.paths.lock_file)?;
         match action {
             Action::Add {
@@ -34,6 +44,7 @@ impl<W: FileWriter> App<W> {
             Action::Current => self.current(),
             Action::Remove { name, force } => self.remove(name, force),
             Action::Activate { name } => self.activate(name),
+            Action::Relay => unreachable!("relay action was handled before locking"),
         }
     }
 
@@ -135,57 +146,46 @@ impl<W: FileWriter> App<W> {
 
         ensure_private_dir(&self.paths.codex_home)?;
         let original_config = read_optional(&self.paths.config_file)?;
-        let original_auth = read_optional(&self.paths.auth_file)?;
         let original_store = read_optional(&self.paths.store_file)?;
-        let prepared = codex::prepare(
-            original_config.as_deref(),
-            original_auth.as_deref(),
-            &profile,
-        )?;
+        let prepared_config = codex::prepare(original_config.as_deref())?;
         store.active = Some(name.clone());
         let active_store = store.encode()?;
         machine.transition(SwitchPhase::Staged);
 
         let result = (|| -> Result<()> {
-            machine.transition(SwitchPhase::WritingAuth);
-            self.writer.write(
-                &self.paths.auth_file,
-                &prepared.auth,
-                FileSensitivity::Secret,
-            )?;
-            machine.transition(SwitchPhase::AuthWritten);
-
-            machine.transition(SwitchPhase::WritingConfig);
-            self.writer.write(
-                &self.paths.config_file,
-                &prepared.config,
-                FileSensitivity::Regular,
-            )?;
-            machine.transition(SwitchPhase::ConfigWritten);
-
-            machine.transition(SwitchPhase::Verifying);
-            if !codex::files_match(&self.paths.config_file, &self.paths.auth_file, &profile)? {
-                bail!("Codex files did not match the selected profile after writing");
-            }
-            machine.transition(SwitchPhase::Verified);
-
             machine.transition(SwitchPhase::RecordingActive);
             self.writer.write(
                 &self.paths.store_file,
                 &active_store,
                 FileSensitivity::Secret,
             )?;
+            machine.transition(SwitchPhase::ActiveRecorded);
+
+            machine.transition(SwitchPhase::WritingConfig);
+            self.writer.write(
+                &self.paths.config_file,
+                &prepared_config,
+                FileSensitivity::Regular,
+            )?;
+            machine.transition(SwitchPhase::ConfigWritten);
+
+            machine.transition(SwitchPhase::Verifying);
+            if !codex::file_matches(&self.paths.config_file)? {
+                bail!("Codex config did not match the relay configuration after writing");
+            }
+            machine.transition(SwitchPhase::Verified);
+
+            machine.transition(SwitchPhase::RestartingRelay);
+            self.relay.restart(&self.paths)?;
+            machine.transition(SwitchPhase::RelayReady);
             machine.transition(SwitchPhase::Done);
             Ok(())
         })();
 
         if let Err(error) = result {
-            if machine.phase() >= SwitchPhase::WritingAuth {
-                let rollback_errors = self.rollback(
-                    original_config.as_deref(),
-                    original_auth.as_deref(),
-                    original_store.as_deref(),
-                );
+            if machine.phase() >= SwitchPhase::RecordingActive {
+                let rollback_errors =
+                    self.rollback(original_config.as_deref(), original_store.as_deref());
                 if !rollback_errors.is_empty() {
                     bail!(
                         "switch failed during {:?}: {error:#}; rollback also failed: {}",
@@ -198,15 +198,12 @@ impl<W: FileWriter> App<W> {
                 .with_context(|| format!("switch failed during {:?}", machine.phase()));
         }
 
-        Ok(format!("Activated profile '{name}'."))
+        Ok(format!(
+            "Activated profile '{name}'. Codex auth.json was left unchanged; restart Codex to use the relay."
+        ))
     }
 
-    fn rollback(
-        &self,
-        config: Option<&[u8]>,
-        auth: Option<&[u8]>,
-        store: Option<&[u8]>,
-    ) -> Vec<String> {
+    fn rollback(&self, config: Option<&[u8]>, store: Option<&[u8]>) -> Vec<String> {
         let mut errors = Vec::new();
         for (path, bytes, sensitivity) in [
             (
@@ -218,11 +215,6 @@ impl<W: FileWriter> App<W> {
                 self.paths.config_file.as_path(),
                 config,
                 FileSensitivity::Regular,
-            ),
-            (
-                self.paths.auth_file.as_path(),
-                auth,
-                FileSensitivity::Secret,
             ),
         ] {
             let result = match bytes {
@@ -240,10 +232,10 @@ impl<W: FileWriter> App<W> {
         let Some(name) = store.active.as_deref() else {
             return Ok(None);
         };
-        let Some(profile) = store.profiles.get(name) else {
+        if !store.profiles.contains_key(name) {
             return Ok(None);
-        };
-        if codex::files_match(&self.paths.config_file, &self.paths.auth_file, profile)? {
+        }
+        if codex::file_matches(&self.paths.config_file)? {
             Ok(Some(name))
         } else {
             Ok(None)
@@ -257,13 +249,14 @@ enum SwitchPhase {
     Loaded,
     Validated,
     Staged,
-    WritingAuth,
-    AuthWritten,
+    RecordingActive,
+    ActiveRecorded,
     WritingConfig,
     ConfigWritten,
     Verifying,
     Verified,
-    RecordingActive,
+    RestartingRelay,
+    RelayReady,
     Done,
 }
 
@@ -341,6 +334,16 @@ mod tests {
     use crate::cli::Action;
     use crate::paths::AppPaths;
     use crate::profile::ProfileStore;
+    use crate::relay::RelayManager;
+
+    #[derive(Clone, Copy)]
+    struct TestRelay;
+
+    impl RelayManager for TestRelay {
+        fn restart(&self, _paths: &AppPaths) -> Result<()> {
+            Ok(())
+        }
+    }
 
     fn add_action() -> Action {
         Action::Add {
@@ -355,7 +358,7 @@ mod tests {
     fn supports_profile_lifecycle_and_detects_external_edits() {
         let temp = tempdir().unwrap();
         let paths = AppPaths::isolated(temp.path());
-        let app = App::new(paths.clone(), RealFileWriter);
+        let app = App::new(paths.clone(), RealFileWriter, TestRelay);
 
         let added = app.execute(add_action()).unwrap();
         assert!(!added.contains("secret-key"));
@@ -369,7 +372,7 @@ mod tests {
         assert!(listed.contains("https://proxy.example.test/v1"));
         assert!(!listed.contains("secret-key"));
 
-        fs::write(&paths.auth_file, "{}").unwrap();
+        fs::write(&paths.config_file, "model_provider = \"other\"\n").unwrap();
         assert_eq!(app.execute(Action::Current).unwrap(), "unmanaged");
     }
 
@@ -377,7 +380,7 @@ mod tests {
     fn duplicate_and_active_removal_require_force() {
         let temp = tempdir().unwrap();
         let paths = AppPaths::isolated(temp.path());
-        let app = App::new(paths, RealFileWriter);
+        let app = App::new(paths, RealFileWriter, TestRelay);
         app.execute(add_action()).unwrap();
         assert!(app.execute(add_action()).is_err());
         app.execute(Action::Activate {
@@ -399,18 +402,19 @@ mod tests {
     }
 
     #[test]
-    fn rolls_back_when_auth_config_or_active_store_writes_fail() {
-        for fail_on in 1..=3 {
+    fn rolls_back_when_config_or_active_store_writes_fail() {
+        for fail_on in 1..=2 {
             let temp = tempdir().unwrap();
             let paths = AppPaths::isolated(temp.path());
-            let setup = App::new(paths.clone(), RealFileWriter);
+            let setup = App::new(paths.clone(), RealFileWriter, TestRelay);
             setup.execute(add_action()).unwrap();
             fs::create_dir_all(&paths.codex_home).unwrap();
             fs::write(&paths.config_file, b"model = \"original\"\n").unwrap();
-            fs::write(&paths.auth_file, b"{\"original\":true}\n").unwrap();
+            let auth_file = paths.codex_home.join("auth.json");
+            fs::write(&auth_file, b"{\"original\":true}\n").unwrap();
             let original_store = fs::read(&paths.store_file).unwrap();
 
-            let app = App::new(paths.clone(), FaultWriter::fail_before(fail_on));
+            let app = App::new(paths.clone(), FaultWriter::fail_before(fail_on), TestRelay);
             assert!(
                 app.execute(Action::Activate {
                     name: "work".into()
@@ -421,10 +425,7 @@ mod tests {
                 fs::read(&paths.config_file).unwrap(),
                 b"model = \"original\"\n"
             );
-            assert_eq!(
-                fs::read(&paths.auth_file).unwrap(),
-                b"{\"original\":true}\n"
-            );
+            assert_eq!(fs::read(&auth_file).unwrap(), b"{\"original\":true}\n");
             assert_eq!(fs::read(&paths.store_file).unwrap(), original_store);
             assert!(
                 ProfileStore::load(&paths.store_file)
@@ -439,13 +440,14 @@ mod tests {
     fn rolls_back_when_verification_detects_corruption() {
         let temp = tempdir().unwrap();
         let paths = AppPaths::isolated(temp.path());
-        let setup = App::new(paths.clone(), RealFileWriter);
+        let setup = App::new(paths.clone(), RealFileWriter, TestRelay);
         setup.execute(add_action()).unwrap();
         fs::create_dir_all(&paths.codex_home).unwrap();
         fs::write(&paths.config_file, b"# original\n").unwrap();
-        fs::write(&paths.auth_file, b"{}\n").unwrap();
+        let auth_file = paths.codex_home.join("auth.json");
+        fs::write(&auth_file, b"{}\n").unwrap();
 
-        let app = App::new(paths.clone(), FaultWriter::corrupt(2));
+        let app = App::new(paths.clone(), FaultWriter::corrupt(2), TestRelay);
         assert!(
             app.execute(Action::Activate {
                 name: "work".into()
@@ -453,7 +455,7 @@ mod tests {
             .is_err()
         );
         assert_eq!(fs::read(&paths.config_file).unwrap(), b"# original\n");
-        assert_eq!(fs::read(&paths.auth_file).unwrap(), b"{}\n");
+        assert_eq!(fs::read(&auth_file).unwrap(), b"{}\n");
     }
 
     enum Fault {
