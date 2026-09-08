@@ -145,6 +145,9 @@ documents the provider fields used here.
 
 ## Development
 
+The system architecture, data flow, persistence model, and key command
+workflows are documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 ~~~bash
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
