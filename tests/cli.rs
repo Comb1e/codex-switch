@@ -151,6 +151,48 @@ fn add_switch_list_current_and_external_edit() {
 }
 
 #[test]
+fn resumes_the_last_selected_profile_in_a_new_process() {
+    let cli = IsolatedCli::new();
+    cli.command()
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no previous profile"));
+    for name in ["first", "last"] {
+        cli.command()
+            .args([
+                "add",
+                "--name",
+                name,
+                "--baseurl",
+                "https://example.test/v1",
+                "--apikey",
+                "test-key",
+            ])
+            .assert()
+            .success();
+        cli.command().arg(name).assert().success();
+    }
+    fs::write(cli.config_file(), "model_provider = \"other\"\n").unwrap();
+    cli.command()
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Activated profile 'last'"));
+    cli.command()
+        .arg("current")
+        .assert()
+        .success()
+        .stdout("last\n");
+    cli.command()
+        .args(["remove", "last", "--force"])
+        .assert()
+        .success();
+    cli.command()
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no previous profile"));
+}
+
+#[test]
 fn accepts_api_key_from_stdin_and_never_echoes_it() {
     let cli = IsolatedCli::new();
     let secret = "stdin-secret";

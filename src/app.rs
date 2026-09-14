@@ -28,8 +28,12 @@ impl<W: FileWriter, R: RelayManager> App<W, R> {
     }
 
     pub fn execute(&self, action: Action) -> Result<String> {
-        if let Action::Relay = action {
-            relay::serve(self.paths.clone())?;
+        if let Action::Relay { data_dir } = action {
+            let paths = match data_dir {
+                Some(directory) => self.paths.clone().with_data_dir(directory),
+                None => self.paths.clone(),
+            };
+            relay::serve(paths)?;
             return Ok(String::new());
         }
         let _lock = LockGuard::acquire(&self.paths.lock_file)?;
@@ -44,7 +48,19 @@ impl<W: FileWriter, R: RelayManager> App<W, R> {
             Action::Current => self.current(),
             Action::Remove { name, force } => self.remove(name, force),
             Action::Activate { name } => self.activate(name),
-            Action::Relay => unreachable!("relay action was handled before locking"),
+            Action::Resume => {
+                let name = ProfileStore::load(&self.paths.store_file)?
+                    .active
+                    .context("no previous profile; run 'cs <name>' once to choose a default")?;
+                self.activate(name)
+            }
+            Action::RelayInstall => {
+                if ProfileStore::load(&self.paths.store_file)?.active.is_some() {
+                    self.relay.restart(&self.paths)?;
+                }
+                Ok(String::new())
+            }
+            Action::Relay { .. } => unreachable!("relay action was handled before locking"),
         }
     }
 
@@ -281,12 +297,28 @@ impl SwitchMachine {
     }
 }
 
-struct LockGuard {
+pub(crate) struct LockGuard {
     file: File,
 }
 
 impl LockGuard {
-    fn acquire(path: &Path) -> Result<Self> {
+    pub(crate) fn acquire(path: &Path) -> Result<Self> {
+        let file = Self::open(path)?;
+        file.lock_exclusive()
+            .with_context(|| format!("could not lock {}", path.display()))?;
+        Ok(Self { file })
+    }
+
+    pub(crate) fn try_acquire(path: &Path) -> Result<Option<Self>> {
+        let file = Self::open(path)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Some(Self { file })),
+            Err(error) if error.kind() == fs2::lock_contended_error().kind() => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("could not lock {}", path.display())),
+        }
+    }
+
+    fn open(path: &Path) -> Result<File> {
         let parent = path
             .parent()
             .ok_or_else(|| anyhow::anyhow!("lock path has no parent: {}", path.display()))?;
@@ -298,9 +330,7 @@ impl LockGuard {
             .write(true)
             .open(path)
             .with_context(|| format!("could not open lock file {}", path.display()))?;
-        file.lock_exclusive()
-            .with_context(|| format!("could not lock {}", path.display()))?;
-        Ok(Self { file })
+        Ok(file)
     }
 }
 

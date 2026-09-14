@@ -1,13 +1,18 @@
 [package]
 name = "codex-switch"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 license = "MIT"
 description = "Switch named Codex API endpoint and API-key profiles"
+default-run = "cs"
 
 [[bin]]
 name = "cs"
 path = "src/main.rs"
+
+[[bin]]
+name = "cs-relay"
+path = "src/relay_startup.rs"
 
 [dependencies]
 anyhow = "1"

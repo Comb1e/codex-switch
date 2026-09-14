@@ -1,7 +1,9 @@
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::process::{Command, Stdio};
+use std::path::Path;
+use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -11,16 +13,28 @@ use reqwest::redirect::Policy;
 use tiny_http::{Header, Request, Response, Server, StatusCode};
 use url::Url;
 
+use crate::app::LockGuard;
 use crate::paths::AppPaths;
 use crate::profile::ProfileStore;
 
 pub const RELAY_HOST: &str = "127.0.0.1";
-pub const RELAY_PORT: u16 = 14556;
+const RELAY_PORT: u16 = 14556;
 pub const PROVIDER_ID: &str = "codex_switch_relay";
 
 const HEALTH_PATH: &str = "/__codex_switch_health";
 const HEALTH_MARKER: &str = "codex-switch-relay";
 const SHUTDOWN_PATH: &str = "/__codex_switch_shutdown";
+
+fn relay_port() -> u16 {
+    // Integration tests use an isolated listener, never the user's live relay.
+    #[cfg(debug_assertions)]
+    if let Ok(port) = std::env::var("CS_TEST_RELAY_PORT") {
+        return port
+            .parse()
+            .expect("CS_TEST_RELAY_PORT must be a port number");
+    }
+    RELAY_PORT
+}
 
 pub trait RelayManager {
     fn restart(&self, paths: &AppPaths) -> Result<()>;
@@ -35,86 +49,185 @@ impl RelayManager for RealRelayManager {
         if std::env::var_os("CS_TEST_SKIP_RELAY_START").is_some() {
             return Ok(());
         }
-        install_autostart()?;
+        install_autostart(paths)?;
         stop_running()?;
 
         let executable = std::env::current_exe().context("could not locate the cs executable")?;
-        let stdout = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&paths.relay_stdout_file)
-            .with_context(|| {
-                format!(
-                    "could not open relay log {}",
-                    paths.relay_stdout_file.display()
-                )
-            })?;
-        let stderr = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&paths.relay_stderr_file)
-            .with_context(|| {
-                format!(
-                    "could not open relay log {}",
-                    paths.relay_stderr_file.display()
-                )
-            })?;
-
-        let mut command = Command::new(executable);
-        command
-            .arg("__relay")
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr));
+        start_background(paths, &executable)?;
         #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x0800_0000);
-        }
-
-        let mut child = command.spawn().context("could not start the local relay")?;
-        for _ in 0..40 {
-            if is_running() {
-                return Ok(());
-            }
-            if let Some(status) = child
-                .try_wait()
-                .context("could not inspect the local relay process")?
-            {
-                bail!(
-                    "local relay exited with {status}; see {}",
-                    paths.relay_stderr_file.display()
-                );
-            }
-            thread::sleep(Duration::from_millis(100));
-        }
-
-        bail!(
-            "local relay did not become ready; see {}",
-            paths.relay_stderr_file.display()
-        )
+        start_supervisor(paths, &executable.with_file_name("cs-relay.exe"))?;
+        Ok(())
     }
 }
 
+/// Keep a single windowless supervisor alive for this profile directory.
+pub fn start_at_login(paths: &AppPaths) -> Result<()> {
+    let supervisor_lock = paths.lock_file.with_file_name(".relay-supervisor.lock");
+    let Some(_supervisor_lock) = LockGuard::try_acquire(&supervisor_lock)? else {
+        return Ok(());
+    };
+    let launcher = std::env::current_exe().context("could not locate the startup launcher")?;
+    let executable = launcher.with_file_name(if cfg!(windows) { "cs.exe" } else { "cs" });
+    let mut child: Option<Child> = None;
+    let mut retry_delay = Duration::from_secs(2);
+    loop {
+        if let Some(worker) = child.as_mut()
+            && worker.try_wait()?.is_some()
+        {
+            child = None;
+        }
+        // A streamed model response may occupy the HTTP server. Port liveness
+        // avoids mistaking that busy worker for a crash and starting duplicates.
+        let result = if port_is_open() {
+            Ok(())
+        } else {
+            (|| -> Result<()> {
+                let _lock = LockGuard::acquire(&paths.lock_file)?;
+                if !port_is_open() && ProfileStore::load(&paths.store_file)?.active.is_some() {
+                    child = Some(start_background(paths, &executable)?);
+                }
+                Ok(())
+            })()
+        };
+        match result {
+            Ok(()) => retry_delay = Duration::from_secs(2),
+            Err(error) => {
+                log_error(paths, &error);
+                retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
+            }
+        }
+        thread::sleep(retry_delay);
+    }
+}
+
+pub fn log_error(paths: &AppPaths, error: &anyhow::Error) {
+    if let Ok(mut log) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&paths.relay_stderr_file)
+    {
+        let _ = writeln!(log, "relay startup failed: {error:#}");
+    }
+}
+
+#[cfg(windows)]
+fn start_supervisor(paths: &AppPaths, executable: &Path) -> Result<()> {
+    let mut command = Command::new(executable);
+    command
+        .arg("--data-dir")
+        .arg(
+            paths
+                .store_file
+                .parent()
+                .context("profile store has no directory")?,
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    hide_console(&mut command);
+    command
+        .spawn()
+        .context("could not start the relay supervisor")?;
+    Ok(())
+}
+
+fn start_background(paths: &AppPaths, executable: &Path) -> Result<Child> {
+    let stdout = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&paths.relay_stdout_file)
+        .with_context(|| {
+            format!(
+                "could not open relay log {}",
+                paths.relay_stdout_file.display()
+            )
+        })?;
+    let stderr = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&paths.relay_stderr_file)
+        .with_context(|| {
+            format!(
+                "could not open relay log {}",
+                paths.relay_stderr_file.display()
+            )
+        })?;
+
+    let mut command = Command::new(executable);
+    command
+        .arg("__relay")
+        .arg("--data-dir")
+        .arg(
+            paths
+                .store_file
+                .parent()
+                .context("profile store has no directory")?,
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr));
+    hide_console(&mut command);
+
+    let mut child = command.spawn().context("could not start the local relay")?;
+    for _ in 0..40 {
+        if is_running() {
+            return Ok(child);
+        }
+        if let Some(status) = child
+            .try_wait()
+            .context("could not inspect the local relay process")?
+        {
+            bail!(
+                "local relay exited with {status}; see {}",
+                paths.relay_stderr_file.display()
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    // A timed-out worker must not be orphaned and duplicated on the next retry.
+    let _ = child.kill();
+    let _ = child.wait();
+    bail!(
+        "local relay did not become ready; see {}",
+        paths.relay_stderr_file.display()
+    )
+}
+
+fn hide_console(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = command;
+}
+
 pub fn base_url() -> String {
-    format!("http://{RELAY_HOST}:{RELAY_PORT}/")
+    format!("http://{RELAY_HOST}:{}/", relay_port())
 }
 
 pub fn serve(paths: AppPaths) -> Result<()> {
-    let address = format!("{RELAY_HOST}:{RELAY_PORT}");
+    let address = format!("{RELAY_HOST}:{}", relay_port());
     let server = Server::http(&address)
         .map_err(|error| anyhow::anyhow!("could not bind local relay to {address}: {error}"))?;
     let client = Client::builder()
         .redirect(Policy::none())
         .build()
         .context("could not create the relay HTTP client")?;
+    let paths = Arc::new(paths);
 
     for request in server.incoming_requests() {
         if request.url() == HEALTH_PATH {
             respond_json(
                 request,
                 200,
-                format!(r#"{{"ok":true,"service":"{HEALTH_MARKER}"}}"#),
+                format!(
+                    r#"{{"ok":true,"service":"{HEALTH_MARKER}","pid":{}}}"#,
+                    std::process::id()
+                ),
             );
             continue;
         }
@@ -122,9 +235,13 @@ pub fn serve(paths: AppPaths) -> Result<()> {
             respond_json(request, 200, r#"{"ok":true}"#.into());
             break;
         }
-        if let Err(error) = forward(request, &client, &paths) {
-            eprintln!("relay request failed: {error:#}");
-        }
+        let client = client.clone();
+        let paths = Arc::clone(&paths);
+        thread::spawn(move || {
+            if let Err(error) = forward(request, &client, &paths) {
+                eprintln!("relay request failed: {error:#}");
+            }
+        });
     }
     Ok(())
 }
@@ -252,13 +369,14 @@ fn stop_running() -> Result<()> {
 }
 
 fn probe(path: &str) -> Result<String> {
-    let address = SocketAddr::from(([127, 0, 0, 1], RELAY_PORT));
+    let address = SocketAddr::from(([127, 0, 0, 1], relay_port()));
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(150))
         .context("could not connect to the local relay")?;
     let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
     let _ = stream.set_write_timeout(Some(Duration::from_millis(300)));
     let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {RELAY_HOST}:{RELAY_PORT}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        "POST {path} HTTP/1.1\r\nHost: {RELAY_HOST}:{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        relay_port()
     );
     stream
         .write_all(request.as_bytes())
@@ -271,15 +389,33 @@ fn probe(path: &str) -> Result<String> {
 }
 
 fn port_is_open() -> bool {
-    let address = SocketAddr::from(([127, 0, 0, 1], RELAY_PORT));
+    let address = SocketAddr::from(([127, 0, 0, 1], relay_port()));
     TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok()
 }
 
 #[cfg(windows)]
-fn install_autostart() -> Result<()> {
+fn install_autostart(paths: &AppPaths) -> Result<()> {
     let executable = std::env::current_exe().context("could not locate the cs executable")?;
-    let command_line = format!("\"{}\" __relay", executable.display());
-    let status = Command::new("reg.exe")
+    let launcher = executable.with_file_name("cs-relay.exe");
+    if !launcher.is_file() {
+        bail!(
+            "startup launcher {} is missing; reinstall cs with install.ps1",
+            launcher.display()
+        );
+    }
+    let data_dir = paths
+        .store_file
+        .parent()
+        .context("profile store has no directory")?
+        .canonicalize()
+        .context("could not resolve the profile directory for startup")?;
+    let command_line = format!(
+        "\"{}\" --data-dir \"{}\"",
+        launcher.display(),
+        data_dir.display()
+    );
+    let mut command = Command::new("reg.exe");
+    command
         .args([
             "add",
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
@@ -292,7 +428,9 @@ fn install_autostart() -> Result<()> {
             "/f",
         ])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    hide_console(&mut command);
+    let status = command
         .status()
         .context("could not register relay startup")?;
     if !status.success() {
@@ -302,7 +440,7 @@ fn install_autostart() -> Result<()> {
 }
 
 #[cfg(not(windows))]
-fn install_autostart() -> Result<()> {
+fn install_autostart(_paths: &AppPaths) -> Result<()> {
     Ok(())
 }
 

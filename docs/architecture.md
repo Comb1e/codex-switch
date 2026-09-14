@@ -6,11 +6,13 @@ and the workflows that change or consume a profile.
 
 ## System architecture
 
-`cs` is a single Rust binary with two execution modes:
+`cs` and `cs-relay` share a Rust library with three execution modes:
 
 - An interactive command-line process manages profiles and Codex configuration.
 - The hidden `cs __relay` process listens only on `127.0.0.1:14556` and proxies
   Codex model requests to the active profile's upstream API.
+- The Windows GUI-subsystem `cs-relay` supervisor runs without a console at
+  login, restores the saved profile, and recovers exited workers.
 
 ```mermaid
 flowchart LR
@@ -19,6 +21,8 @@ flowchart LR
     CLI --> Config[(Codex config.toml)]
     CLI --> Startup[Windows user startup entry]
     CLI --> Relay[Relay process<br/>cs __relay]
+    Startup --> Supervisor[Windowless cs-relay supervisor]
+    Supervisor -->|start and recover| Relay
 
     Desktop[Codex Desktop] -->|ChatGPT bearer token| Relay
     Relay -->|read active profile| Store
@@ -38,7 +42,8 @@ adds the active profile's API key, and never forwards the ChatGPT access token.
 
 ```mermaid
 flowchart TD
-    Main[main.rs<br/>bootstrap and error reporting] --> Cli[cli.rs<br/>argument parsing and API-key input]
+    Entry[main.rs / relay_startup.rs] --> Main[lib.rs<br/>shared entry points and error reporting]
+    Main --> Cli[cli.rs<br/>argument parsing and API-key input]
     Main --> Paths[paths.rs<br/>platform path discovery]
     Main --> App[app.rs<br/>command orchestration]
 
@@ -53,16 +58,17 @@ flowchart TD
     Codex --> Relay
     Relay --> Paths
     Relay --> Profile
+    Main -->|login| Relay
 ```
 
 | Module | Responsibility | Important interface |
 | --- | --- | --- |
-| `main` | Parse, construct dependencies, execute, and print results | `run` |
+| `main`, `relay_startup`, `lib` | Console and windowless entry points; shared dependency construction | `run`, `startup` |
 | `cli` | Convert command-line syntax into domain actions without printing secrets | `Cli::into_action`, `Action` |
 | `app` | Coordinate commands, locking, activation, verification, and rollback | `App::execute` |
 | `profile` | Load, validate the version of, encode, and save the JSON profile store | `ProfileStore` |
 | `codex` | Preserve unrelated TOML while installing and checking the relay provider | `prepare`, `file_matches` |
-| `relay` | Restart the managed process, expose health controls, and proxy requests | `RelayManager`, `serve` |
+| `relay` | Register login, supervise workers, expose health controls, and proxy requests | `RelayManager`, `start_at_login`, `serve` |
 | `atomic` | Write files atomically and apply sensitive-file permissions | `FileWriter` |
 | `paths` | Resolve all platform-dependent files from environment and OS directories | `AppPaths` |
 | `validation` | Enforce profile name, URL, and API-key constraints | `validate_*` |
@@ -78,6 +84,7 @@ flowchart TB
     Env[Environment and OS directories] --> Paths[AppPaths::discover]
     Paths --> ProfilePath[Platform config directory/cs/profiles.json]
     Paths --> LockPath[Platform config directory/cs/.lock]
+    Paths --> SupervisorLock[Platform config directory/cs/.relay-supervisor.lock]
     Paths --> Logs[Platform config directory/cs/relay.*.log]
     Paths --> CodexHome[CODEX_HOME or user home/.codex]
     CodexHome --> Config[config.toml]
@@ -88,17 +95,20 @@ flowchart TB
     App -->|regular atomic write| Config
     Relay[Relay process] -->|read for each request| ProfilePath
     Relay -->|errors only| Logs
+    Supervisor[Windowless supervisor] -->|singleton lock| SupervisorLock
+    Supervisor -->|lock during recovery| LockPath
     App -. never reads or writes .-> Auth
     Relay -. never reads or writes .-> Auth
 ```
 
-`profiles.json` is a versioned JSON document containing the active profile and
+`profiles.json` is a versioned JSON document containing the last successfully
+selected profile in `active` and
 a sorted map of names to base URLs and plaintext API keys. On Unix, the store
 directory is mode `0700` and the store is mode `0600`; on Windows it inherits
 the current user's local application-data ACL. `config.toml` contains only the
 loopback provider configuration, never the upstream URL or profile API key.
 
-All user-facing commands except `__relay` acquire the same exclusive `.lock`
+All commands except the internal `__relay` worker acquire the same exclusive `.lock`
 file. Writes use a temporary file plus atomic replacement, and activation keeps
 the previous bytes so both modified files can be restored if any later step
 fails.
@@ -118,12 +128,16 @@ flowchart TD
     Dispatch -->|Current| Current[Load store<br/>verify configured provider<br/>print name or unmanaged]
     Dispatch -->|Remove| Remove[Validate name<br/>enforce force rule<br/>atomic save]
     Dispatch -->|Activate| Activate[Run activation state machine]
+    Dispatch -->|Resume: bare cs| Resume[Load saved active name<br/>error if none]
+    Resume --> Activate
+    Dispatch -->|Internal installer migration| Install[If active profile saved:<br/>register startup and restart relay]
 
     Add --> Output[Return display-safe output]
     List --> Output
     Current --> Output
     Remove --> Output
     Activate --> Output
+    Install --> Output
 ```
 
 `current` and the active marker shown by `list` are deliberately verified
@@ -149,7 +163,7 @@ stateDiagram-v2
     ConfigWritten --> Verifying
     Verifying --> Verified: config matches required provider
     Verified --> RestartingRelay
-    RestartingRelay --> RelayReady: relay health check passes
+    RestartingRelay --> RelayReady: worker healthy and supervisor spawned
     RelayReady --> Done
     Done --> [*]
 
@@ -197,6 +211,9 @@ another origin. Request headers excluded from forwarding are `authorization`,
 connection-specific headers, `host`, content length, and proxy authorization.
 Equivalent hop-by-hop response headers are also removed. The body is buffered
 for the upstream request; the upstream response body is streamed back to Codex.
+Each model request runs on its own thread so health and shutdown controls are
+not queued behind long model responses. The HTTP client is shared by cloning
+its connection pool handle.
 
 ## Relay lifecycle
 
@@ -209,13 +226,52 @@ flowchart TD
     Probe -->|no| Spawn
     Closed --> Spawn[Spawn cs __relay with log files]
     Spawn --> Ready{Health marker received?}
-    Ready -->|yes, within 4 seconds| Success[Activation succeeds]
+    Ready -->|yes| Supervisor[Spawn windowless supervisor on Windows]
+    Supervisor --> Success[Activation succeeds]
     Ready -->|child exits or timeout| Failure[Activation fails and files roll back]
 ```
 
 The health and shutdown endpoints are bound to loopback with the relay and are
 used only for lifecycle management. The health probe verifies a service marker,
 not merely that some process has opened port `14556`.
+
+The Run entry invokes `cs-relay.exe --data-dir <absolute saved directory>`.
+Both login and activation use the same worker launch function, with null stdin,
+redirected stdout/stderr, and `CREATE_NO_WINDOW` on Windows. Startup registry
+commands are hidden too. The Windows installer refreshes this registration and
+restarts an already selected profile without rewriting Codex configuration.
+
+```mermaid
+flowchart LR
+    Build[Build locked release binaries] --> Stop[Stop installed supervisor then workers]
+    Stop --> Install[Cargo install with locked dependencies]
+    Install --> Migrate[Refresh login entry and start saved profile]
+    Install -->|failure| Restore[Attempt to restart previous installed profile]
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> ClaimSupervisor: Windows login or activation
+    ClaimSupervisor --> Exit: singleton lock already held
+    ClaimSupervisor --> Monitor: singleton lock acquired
+    Monitor --> Monitor: port open; check every 2 seconds
+    Monitor --> Recover: port closed
+    Recover --> Locked: acquire command lock
+    Locked --> Monitor: worker returned or no saved active profile
+    Locked --> Starting: saved active profile and port closed
+    Starting --> Monitor: detached worker passes health check
+    Starting --> Backoff: launch fails; log error
+    Backoff --> Monitor: retry delay doubles up to 30 seconds
+    Exit --> [*]
+```
+
+The supervisor uses port liveness for ongoing monitoring and the identity health
+check for new-worker readiness. It releases the command lock between recovery
+attempts so normal profile switching stays available. Duplicate supervisors exit
+immediately. A startup timeout terminates and reaps its own incomplete worker
+before another recovery attempt. The last successful profile stays in the store
+across process exits and reboot; bare `cs` loads that name and uses the ordinary
+activation transaction. Removing or replacing the active profile clears it.
 
 ## Change checklist
 

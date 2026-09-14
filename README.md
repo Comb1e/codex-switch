@@ -30,7 +30,11 @@ Bash:
 ./install.sh
 ~~~
 
-Both scripts run cargo install --path <repository> --force. If cs is not found
+Both scripts install `cs` and its `cs-relay` background helper with Cargo.
+The Windows installer builds the locked dependencies first, stops only the
+installed relay processes for replacement, migrates an existing startup entry,
+and restarts the last selected profile automatically.
+If cs is not found
 afterward, add Cargo's bin directory to PATH (%USERPROFILE%\.cargo\bin on
 Windows or $HOME/.cargo/bin on Linux).
 
@@ -41,6 +45,8 @@ Save the relay key without echoing it in the terminal, then activate the profile
 ~~~powershell
 $env:RELAY_API_KEY | cs add --name transit --baseurl "http://154.201.72.176:8080/" --apikey-stdin
 cs transit
+# Later, reuse the last selected profile:
+cs
 ~~~
 
 For the migration sequence where the relay key is currently stored in
@@ -64,9 +70,19 @@ After activation, place the ChatGPT login file produced by
 ~/.codex/auth.json, or use Codex's normal ChatGPT login. Close and reopen Codex
 Desktop after changing the configuration or authentication file.
 
-The relay starts automatically when the same Windows user next signs in. The
-startup command contains only the cs executable path; the upstream URL and API
-key remain in the profile store.
+The last successfully selected profile is remembered across restarts. Running
+`cs` without arguments activates that profile; on a new installation, select one
+with `cs <name>` first. Removing or replacing the active profile clears the default.
+
+When the same Windows user signs in, the windowless `cs-relay.exe` supervisor
+automatically starts the remembered profile. It stays in the background and
+restarts the relay within a few seconds if the worker exits. No terminal needs
+to remain open. Duplicate launches reuse the existing supervisor. Startup uses
+the saved absolute profile directory, so it does not depend on the login
+working directory or terminal environment. Startup entries contain no API keys.
+Failures are recorded in `relay.stderr.log` beside `profiles.json`, with retries
+backing off to 30 seconds. This is a per-user background service, active while
+the user is signed in; it is not a system service running before login.
 
 ## Generated Codex configuration
 
@@ -146,7 +162,7 @@ documents the provider fields used here.
 ## Development
 
 The system architecture, data flow, persistence model, and key command
-workflows are documented in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+workflows are documented in [docs/architecture.md](docs/architecture.md).
 
 ~~~bash
 cargo fmt --check

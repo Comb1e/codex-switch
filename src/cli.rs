@@ -8,8 +8,7 @@ use clap::{ArgGroup, Args, Parser, Subcommand};
 #[command(
     name = "cs",
     version,
-    about = "Switch named Codex endpoint and API-key profiles",
-    arg_required_else_help = true
+    about = "Switch named Codex endpoint and API-key profiles; omit the name to resume the last profile"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -28,7 +27,13 @@ enum Command {
     Remove(RemoveArgs),
     /// Internal command used by the local relay process.
     #[command(name = "__relay", hide = true)]
-    Relay,
+    Relay {
+        #[arg(long)]
+        data_dir: Option<std::path::PathBuf>,
+    },
+    /// Refresh startup registration and restart a previously activated relay.
+    #[command(name = "__relay-install", hide = true)]
+    RelayInstall,
     /// A profile name may be used directly, for example: cs work
     #[command(external_subcommand)]
     Profile(Vec<OsString>),
@@ -83,7 +88,11 @@ pub enum Action {
     Activate {
         name: String,
     },
-    Relay,
+    Resume,
+    Relay {
+        data_dir: Option<std::path::PathBuf>,
+    },
+    RelayInstall,
 }
 
 impl Cli {
@@ -101,7 +110,8 @@ impl Cli {
                 name: args.name,
                 force: args.force,
             }),
-            Some(Command::Relay) => Ok(Action::Relay),
+            Some(Command::Relay { data_dir }) => Ok(Action::Relay { data_dir }),
+            Some(Command::RelayInstall) => Ok(Action::RelayInstall),
             Some(Command::Profile(parts)) => {
                 if parts.len() != 1 {
                     bail!("activation accepts exactly one profile name");
@@ -113,7 +123,7 @@ impl Cli {
                     name: name.to_owned(),
                 })
             }
-            None => bail!("a command or profile name is required"),
+            None => Ok(Action::Resume),
         }
     }
 }

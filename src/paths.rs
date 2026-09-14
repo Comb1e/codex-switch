@@ -15,6 +15,14 @@ pub struct AppPaths {
 }
 
 impl AppPaths {
+    pub fn with_data_dir(mut self, directory: PathBuf) -> Self {
+        self.store_file = directory.join("profiles.json");
+        self.lock_file = directory.join(".lock");
+        self.relay_stdout_file = directory.join("relay.stdout.log");
+        self.relay_stderr_file = directory.join("relay.stderr.log");
+        self
+    }
+
     pub fn discover() -> Result<Self> {
         #[cfg(windows)]
         let config_root = nonempty_env("LOCALAPPDATA")
