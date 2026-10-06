@@ -45,6 +45,7 @@ impl<W: FileWriter, R: RelayManager> App<W, R> {
                 force,
             } => self.add(name, base_url, api_key, force),
             Action::List => self.list(),
+            Action::Status => self.status(),
             Action::Current => self.current(),
             Action::Remove { name, force } => self.remove(name, force),
             Action::Activate { name } => self.activate(name),
@@ -88,10 +89,24 @@ impl<W: FileWriter, R: RelayManager> App<W, R> {
 
     fn list(&self) -> Result<String> {
         let store = ProfileStore::load(&self.paths.store_file)?;
-        if store.profiles.is_empty() {
-            return Ok("No profiles saved.".into());
-        }
         let active = self.verified_active(&store)?;
+        Ok(Self::format_profiles(&store, active))
+    }
+
+    fn status(&self) -> Result<String> {
+        let store = ProfileStore::load(&self.paths.store_file)?;
+        let active = self.verified_active(&store)?;
+        Ok(format!(
+            "Current provider: {}\n\n{}",
+            active.unwrap_or("unmanaged"),
+            Self::format_profiles(&store, active)
+        ))
+    }
+
+    fn format_profiles(store: &ProfileStore, active: Option<&str>) -> String {
+        if store.profiles.is_empty() {
+            return "No profiles saved.".into();
+        }
         let width = store
             .profiles
             .keys()
@@ -119,7 +134,7 @@ impl<W: FileWriter, R: RelayManager> App<W, R> {
                 width = width
             ));
         }
-        Ok(lines.join("\n"))
+        lines.join("\n")
     }
 
     fn current(&self) -> Result<String> {

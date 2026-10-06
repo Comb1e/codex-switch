@@ -1,7 +1,9 @@
 use anyhow::{Result, bail};
 use url::Url;
 
-const RESERVED_NAMES: &[&str] = &["add", "list", "current", "remove", "help", "version"];
+const RESERVED_NAMES: &[&str] = &[
+    "add", "list", "status", "current", "remove", "help", "version",
+];
 
 pub fn validate_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 64 {
@@ -62,10 +64,10 @@ mod tests {
 
     #[test]
     fn validates_profile_names() {
-        for name in ["work", "proxy-1", "team_api", "v1.2"] {
+        for name in ["work", "proxy-1", "team_api", "v1.2", "status-1"] {
             validate_name(name).unwrap();
         }
-        for name in ["", "Work", "bad name", "-bad", "list"] {
+        for name in ["", "Work", "bad name", "-bad", "list", "status"] {
             assert!(
                 validate_name(name).is_err(),
                 "accepted invalid name: {name}"

@@ -21,6 +21,8 @@ enum Command {
     Add(AddArgs),
     /// List saved profiles without showing API keys.
     List,
+    /// Show the current provider and all saved profiles without API keys.
+    Status,
     /// Print the active profile, or "unmanaged".
     Current,
     /// Remove a saved profile.
@@ -80,6 +82,7 @@ pub enum Action {
         force: bool,
     },
     List,
+    Status,
     Current,
     Remove {
         name: String,
@@ -105,6 +108,7 @@ impl Cli {
                 force: args.force,
             }),
             Some(Command::List) => Ok(Action::List),
+            Some(Command::Status) => Ok(Action::Status),
             Some(Command::Current) => Ok(Action::Current),
             Some(Command::Remove(args)) => Ok(Action::Remove {
                 name: args.name,

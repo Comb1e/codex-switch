@@ -60,9 +60,17 @@ impl IsolatedCli {
 }
 
 #[test]
-fn add_switch_list_current_and_external_edit() {
+fn add_switch_list_status_current_and_external_edit() {
     let cli = IsolatedCli::new();
     let secret = "key-\"quoted\\value";
+
+    cli.command()
+        .arg("status")
+        .assert()
+        .success()
+        .stdout("Current provider: unmanaged\n\nNo profiles saved.\n");
+    assert!(!cli.config_file().exists());
+    assert!(!cli.store_file().exists());
 
     cli.command()
         .args([
@@ -79,6 +87,27 @@ fn add_switch_list_current_and_external_edit() {
         .stdout(predicate::str::contains("Saved profile 'work'"))
         .stdout(predicate::str::contains(secret).not())
         .stderr(predicate::str::contains(secret).not());
+
+    cli.command()
+        .args([
+            "add",
+            "--name",
+            "personal",
+            "--baseurl",
+            "https://personal.example.test/v1",
+            "--apikey",
+            "personal-secret",
+        ])
+        .assert()
+        .success();
+    cli.command()
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Current provider: unmanaged"))
+        .stdout(predicate::str::contains("personal"))
+        .stdout(predicate::str::contains("work"))
+        .stdout(predicate::str::contains("yes").not());
 
     fs::create_dir_all(&cli.codex_home).unwrap();
     let original_auth = br#"{"auth_mode":"chatgpt","OPENAI_API_KEY":null,"other":"preserved"}"#;
@@ -142,12 +171,94 @@ fn add_switch_list_current_and_external_edit() {
         .stdout(predicate::str::contains("yes"))
         .stdout(predicate::str::contains(secret).not());
 
-    fs::write(cli.config_file(), "model_provider = \"other\"\n").unwrap();
+    let original_config = fs::read(cli.config_file()).unwrap();
+    let original_store = fs::read(cli.store_file()).unwrap();
+    cli.command()
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(
+            "Current provider: work\n\nNAME      ACTIVE  BASE URL\npersonal          https://personal.example.test/v1\nwork      yes     https://proxy.example.test/v1\n",
+        )
+        .stdout(predicate::str::contains(secret).not())
+        .stdout(predicate::str::contains("personal-secret").not())
+        .stderr(predicate::str::contains(secret).not());
+    assert_eq!(fs::read(cli.config_file()).unwrap(), original_config);
+    assert_eq!(fs::read(cli.store_file()).unwrap(), original_store);
+    assert_eq!(fs::read(cli.auth_file()).unwrap(), original_auth);
+
+    for config in ["model_provider = \"other\"\n", "not = [toml", ""] {
+        fs::write(cli.config_file(), config).unwrap();
+        cli.command()
+            .arg("status")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Current provider: unmanaged"))
+            .stdout(predicate::str::contains("personal"))
+            .stdout(predicate::str::contains("work"))
+            .stdout(predicate::str::contains("yes").not());
+    }
+    fs::remove_file(cli.config_file()).unwrap();
     cli.command()
         .arg("current")
         .assert()
         .success()
         .stdout("unmanaged\n");
+    cli.command()
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Current provider: unmanaged"))
+        .stdout(predicate::str::contains("yes").not());
+
+    fs::write(cli.config_file(), original_config).unwrap();
+    let mut store: Value = serde_json::from_slice(&original_store).unwrap();
+    store["profiles"].as_object_mut().unwrap().remove("work");
+    fs::write(cli.store_file(), serde_json::to_vec(&store).unwrap()).unwrap();
+    cli.command()
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Current provider: unmanaged"))
+        .stdout(predicate::str::contains("personal"))
+        .stdout(predicate::str::contains("work").not())
+        .stdout(predicate::str::contains("yes").not());
+}
+
+#[test]
+fn status_rejects_extra_arguments_and_reserved_profile_name() {
+    let cli = IsolatedCli::new();
+    cli.command()
+        .args(["status", "extra"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unexpected argument"));
+    cli.command()
+        .args([
+            "add",
+            "--name",
+            "status",
+            "--baseurl",
+            "https://example.test/v1",
+            "--apikey",
+            "secret",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("reserved"));
+    cli.command()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("status"));
+
+    fs::write(cli.store_file(), "not JSON").unwrap();
+    cli.command()
+        .arg("status")
+        .assert()
+        .failure()
+        .stdout("")
+        .stderr(predicate::str::contains("profile store is invalid JSON"));
 }
 
 #[test]

@@ -61,17 +61,17 @@ flowchart TD
     Main -->|login| Relay
 ```
 
-| Module | Responsibility | Important interface |
-| --- | --- | --- |
-| `main`, `relay_startup`, `lib` | Console and windowless entry points; shared dependency construction | `run`, `startup` |
-| `cli` | Convert command-line syntax into domain actions without printing secrets | `Cli::into_action`, `Action` |
-| `app` | Coordinate commands, locking, activation, verification, and rollback | `App::execute` |
-| `profile` | Load, validate the version of, encode, and save the JSON profile store | `ProfileStore` |
-| `codex` | Preserve unrelated TOML while installing and checking the relay provider | `prepare`, `file_matches` |
-| `relay` | Register login, supervise workers, expose health controls, and proxy requests | `RelayManager`, `start_at_login`, `serve` |
-| `atomic` | Write files atomically and apply sensitive-file permissions | `FileWriter` |
-| `paths` | Resolve all platform-dependent files from environment and OS directories | `AppPaths` |
-| `validation` | Enforce profile name, URL, and API-key constraints | `validate_*` |
+| Module | Responsibility |
+| --- | --- |
+| `main`, `relay_startup`, `lib` | Console and windowless entry points; shared dependency construction |
+| `cli` | Convert command-line syntax into domain actions without printing secrets |
+| `app` | Coordinate commands, status reporting, locking, activation, verification, and rollback |
+| `profile` | Load, validate the version of, encode, and save the JSON profile store |
+| `codex` | Preserve unrelated TOML while installing and checking the relay provider |
+| `relay` | Register login, supervise workers, expose health controls, and proxy requests |
+| `atomic` | Write files atomically and apply sensitive-file permissions |
+| `paths` | Resolve all platform-dependent files from environment and OS directories |
+| `validation` | Enforce profile name, URL, and API-key constraints |
 
 `FileWriter` and `RelayManager` are dependency-injection boundaries. Production
 uses `RealFileWriter` and `RealRelayManager`; tests replace them to exercise
@@ -125,6 +125,7 @@ flowchart TD
 
     Dispatch -->|Add| Add[Validate input<br/>load store<br/>insert profile<br/>atomic save]
     Dispatch -->|List| List[Load store<br/>verify configured provider<br/>format profiles]
+    Dispatch -->|Status| Status[Load store once<br/>verify configured provider<br/>print current provider and all profiles]
     Dispatch -->|Current| Current[Load store<br/>verify configured provider<br/>print name or unmanaged]
     Dispatch -->|Remove| Remove[Validate name<br/>enforce force rule<br/>atomic save]
     Dispatch -->|Activate| Activate[Run activation state machine]
@@ -134,16 +135,27 @@ flowchart TD
 
     Add --> Output[Return display-safe output]
     List --> Output
+    Status --> Output
     Current --> Output
     Remove --> Output
     Activate --> Output
     Install --> Output
 ```
 
-`current` and the active marker shown by `list` are deliberately verified
-values. A name is active only when it exists in the store and `config.toml`
-still exactly matches the required relay configuration. External edits therefore
-produce `unmanaged` rather than a stale active result.
+`current`, `status`, and the active marker shown by `list` are verified values.
+A name is active only when it exists in the store and `config.toml` still
+exactly matches the required relay configuration. External edits, missing or
+malformed TOML, and stale references to deleted profiles therefore produce
+`unmanaged` rather than a stale active result. Unreadable files and an invalid
+profile store produce errors instead of a status report.
+
+`status` reports the current provider and all saved profiles with their base
+URLs and active markers. It uses one loaded store and one verification result
+for the summary and table, and shares table formatting with `list`. With no
+profiles, it reports `unmanaged` and `No profiles saved.`. Reporting never
+writes Codex configuration or profile data, prints API keys, activates a profile,
+or restarts the relay; the shared command lock still applies. This verifies
+configured selection, not worker health or the desktop's in-memory configuration.
 
 ## Activation state machine
 
