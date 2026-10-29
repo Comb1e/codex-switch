@@ -10,9 +10,9 @@ paths, [docs/usage.md](docs/usage.md) for commands, and
 - `src/lib.rs`: shared CLI and startup setup and error handling.
 - `src/cli.rs`: command parsing and API-key input.
 - `src/app.rs`: profile operations, verified provider status, shared list
-  formatting, command locking, and activation rollback.
-- `src/profile.rs`: versioned JSON profile storage.
-- `src/codex.rs`: Codex TOML generation and configuration verification.
+  formatting, official GPT mode, command locking, and activation rollback.
+- `src/profile.rs`: versioned JSON profile storage and persisted relay/GPT mode.
+- `src/codex.rs`: relay and official OpenAI TOML generation and verification.
 - `src/relay.rs`: worker and supervisor lifecycle, startup registration, and
   HTTP forwarding.
 - `src/paths.rs`: environment and platform path discovery.

@@ -2,12 +2,13 @@
 
 `cs` switches named API providers for Codex Desktop through a local relay,
 letting Codex keep its ChatGPT login while model requests use the selected
-provider's API key.
+provider's API key. Use `cs gpt` to switch to the official OpenAI provider
+directly, without the relay.
 
 ## Requirements
 
 - Rust and Cargo to build from source.
-- Codex Desktop with a ChatGPT login and an upstream HTTP(S) API key.
+- Codex Desktop with a ChatGPT login; custom providers also need an upstream HTTP(S) API key.
 - PowerShell on Windows or Bash on Linux for the installer.
 
 ## Installation
@@ -45,8 +46,17 @@ cs work
 cs status
 ~~~
 
-Restart Codex Desktop after activation so it reloads configuration. Running
-`cs` without arguments reactivates the last selected provider.
+Switch to the official OpenAI provider using your existing Codex login:
+
+~~~text
+cs gpt
+~~~
+
+This stops the relay and prevents it from restarting at login. Saved custom
+profiles remain available: run `cs work` to use a saved provider again.
+Restart Codex Desktop after switching so it reloads configuration. Running
+`cs` without arguments restores the last selected mode, including `gpt`.
+`gpt` is a reserved command and cannot be used as a custom profile name.
 
 ## Common checks
 

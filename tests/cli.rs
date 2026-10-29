@@ -226,31 +226,33 @@ fn add_switch_list_status_current_and_external_edit() {
 }
 
 #[test]
-fn status_rejects_extra_arguments_and_reserved_profile_name() {
+fn status_and_gpt_reject_extra_arguments_and_reserved_profile_names() {
     let cli = IsolatedCli::new();
-    cli.command()
-        .args(["status", "extra"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("unexpected argument"));
-    cli.command()
-        .args([
-            "add",
-            "--name",
-            "status",
-            "--baseurl",
-            "https://example.test/v1",
-            "--apikey",
-            "secret",
-        ])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("reserved"));
-    cli.command()
-        .arg("--help")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("status"));
+    for name in ["status", "gpt"] {
+        cli.command()
+            .args([name, "extra"])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("unexpected argument"));
+        cli.command()
+            .args([
+                "add",
+                "--name",
+                name,
+                "--baseurl",
+                "https://example.test/v1",
+                "--apikey",
+                "secret",
+            ])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("reserved"));
+        cli.command()
+            .arg("--help")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(name));
+    }
 
     fs::write(cli.store_file(), "not JSON").unwrap();
     cli.command()
@@ -301,6 +303,110 @@ fn resumes_the_last_selected_profile_in_a_new_process() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("no previous profile"));
+}
+
+#[test]
+fn gpt_works_without_profiles_and_switches_back_to_a_saved_provider() {
+    let cli = IsolatedCli::new();
+    cli.command()
+        .arg("gpt")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "official OpenAI provider, no switch relay",
+        ));
+    assert!(!cli.auth_file().exists());
+    cli.command()
+        .arg("status")
+        .assert()
+        .success()
+        .stdout("Current provider: gpt\n\nNo profiles saved.\n");
+    let store: Value = serde_json::from_slice(&fs::read(cli.store_file()).unwrap()).unwrap();
+    assert_eq!(store["mode"], "gpt");
+    assert!(store.get("active").is_none());
+    assert_eq!(
+        fs::read_to_string(cli.config_file()).unwrap(),
+        "model_provider = \"openai\"\n"
+    );
+
+    let auth = br#"{"auth_mode":"chatgpt","tokens":{"access_token":"preserved-token"}}"#;
+    fs::write(cli.auth_file(), auth).unwrap();
+    fs::write(cli.config_file(), "model = \"gpt-test\" # keep\n").unwrap();
+    cli.command()
+        .args([
+            "add",
+            "--name",
+            "work",
+            "--baseurl",
+            "https://example.test/v1",
+            "--apikey",
+            "saved-key",
+        ])
+        .assert()
+        .success();
+    cli.command().arg("work").assert().success();
+    cli.command()
+        .arg("current")
+        .assert()
+        .success()
+        .stdout("work\n");
+
+    cli.command().arg("gpt").assert().success();
+    let original_config = fs::read(cli.config_file()).unwrap();
+    let original_store = fs::read(cli.store_file()).unwrap();
+    for args in [vec![], vec!["gpt"], vec!["__relay-install"]] {
+        cli.command().args(args).assert().success();
+        cli.command()
+            .arg("current")
+            .assert()
+            .success()
+            .stdout("gpt\n");
+        cli.command()
+            .arg("status")
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Current provider: gpt"))
+            .stdout(predicate::str::contains("work"))
+            .stdout(predicate::str::contains("yes").not())
+            .stdout(predicate::str::contains("saved-key").not());
+        assert_eq!(fs::read(cli.config_file()).unwrap(), original_config);
+        assert_eq!(fs::read(cli.store_file()).unwrap(), original_store);
+        assert_eq!(fs::read(cli.auth_file()).unwrap(), auth);
+    }
+    let text = std::str::from_utf8(&original_config).unwrap();
+    assert!(text.contains("model = \"gpt-test\" # keep"));
+    assert!(!text.contains("codex_switch_relay"));
+
+    for changed in ["model_provider = \"other\"\n", "not = [toml"] {
+        fs::write(cli.config_file(), changed).unwrap();
+        cli.command()
+            .arg("current")
+            .assert()
+            .success()
+            .stdout("unmanaged\n");
+    }
+    cli.command()
+        .arg("gpt")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not valid TOML"));
+    assert_eq!(
+        fs::read_to_string(cli.config_file()).unwrap(),
+        "not = [toml"
+    );
+    assert_eq!(fs::read(cli.store_file()).unwrap(), original_store);
+    fs::write(cli.config_file(), &original_config).unwrap();
+    cli.command().arg("work").assert().success();
+    cli.command()
+        .arg("current")
+        .assert()
+        .success()
+        .stdout("work\n");
+    let store: Value = serde_json::from_slice(&fs::read(cli.store_file()).unwrap()).unwrap();
+    assert_eq!(store["mode"], "relay");
+    assert_eq!(store["active"], "work");
+    assert_eq!(store["profiles"]["work"]["api_key"], "saved-key");
+    assert_eq!(fs::read(cli.auth_file()).unwrap(), auth);
 }
 
 #[test]
