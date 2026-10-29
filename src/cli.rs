@@ -8,7 +8,7 @@ use clap::{ArgGroup, Args, Parser, Subcommand};
 #[command(
     name = "cs",
     version,
-    about = "Switch named Codex endpoint and API-key profiles; omit the name to resume the last profile"
+    about = "Switch named Codex endpoint and API-key profiles; omit the name to resume the last selected mode"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -19,8 +19,12 @@ pub struct Cli {
 enum Command {
     /// Save a named endpoint and API-key profile.
     Add(AddArgs),
+    /// Use the official OpenAI provider directly, without the switch relay.
+    Gpt,
     /// List saved profiles without showing API keys.
     List,
+    /// Show the current provider and all saved profiles without API keys.
+    Status,
     /// Print the active profile, or "unmanaged".
     Current,
     /// Remove a saved profile.
@@ -79,7 +83,9 @@ pub enum Action {
         api_key: String,
         force: bool,
     },
+    Gpt,
     List,
+    Status,
     Current,
     Remove {
         name: String,
@@ -104,7 +110,9 @@ impl Cli {
                 api_key: read_api_key(args.apikey, args.apikey_stdin)?,
                 force: args.force,
             }),
+            Some(Command::Gpt) => Ok(Action::Gpt),
             Some(Command::List) => Ok(Action::List),
+            Some(Command::Status) => Ok(Action::Status),
             Some(Command::Current) => Ok(Action::Current),
             Some(Command::Remove(args)) => Ok(Action::Remove {
                 name: args.name,

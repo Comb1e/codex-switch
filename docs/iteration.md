@@ -1,5 +1,22 @@
 # Iteration history
 
+## 2026-10-06 — Provider status
+
+Added `cs status` to show the current verified provider and every saved profile
+with its base URL and active marker. The summary and table use the same store
+snapshot and configuration verification; table formatting is shared with
+`cs list`. `status` is reserved as a command name. The existing `current`,
+`list`, switching, and resume behavior is preserved.
+
+Validation extends the existing CLI lifecycle coverage to include multiple
+providers, inactive and active selections, missing and malformed configuration,
+read-only behavior, and absence of API keys in output. Command parsing and
+reserved-name rejection are checked separately. The README is now a quick start;
+detailed usage is in `usage.md`, and history is kept here.
+
+Project reference used: [rustup command examples](https://github.com/rust-lang/rustup/blob/master/doc/user-guide/src/examples.md).
+Its `rustup show` command informed the explicit current-selection summary.
+
 ## 2026-09-14 — 0.2.2
 
 The previous version registered the console worker (`cs __relay`) directly in

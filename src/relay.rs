@@ -15,7 +15,7 @@ use url::Url;
 
 use crate::app::LockGuard;
 use crate::paths::AppPaths;
-use crate::profile::ProfileStore;
+use crate::profile::{ProfileStore, ProviderMode};
 
 pub const RELAY_HOST: &str = "127.0.0.1";
 const RELAY_PORT: u16 = 14556;
@@ -38,6 +38,7 @@ fn relay_port() -> u16 {
 
 pub trait RelayManager {
     fn restart(&self, paths: &AppPaths) -> Result<()>;
+    fn stop(&self) -> Result<()>;
 }
 
 #[derive(Clone, Copy)]
@@ -57,6 +58,14 @@ impl RelayManager for RealRelayManager {
         #[cfg(windows)]
         start_supervisor(paths, &executable.with_file_name("cs-relay.exe"))?;
         Ok(())
+    }
+
+    fn stop(&self) -> Result<()> {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("CS_TEST_SKIP_RELAY_START").is_some() {
+            return Ok(());
+        }
+        stop_running()
     }
 }
 
@@ -78,19 +87,20 @@ pub fn start_at_login(paths: &AppPaths) -> Result<()> {
         }
         // A streamed model response may occupy the HTTP server. Port liveness
         // avoids mistaking that busy worker for a crash and starting duplicates.
-        let result = if port_is_open() {
-            Ok(())
-        } else {
-            (|| -> Result<()> {
-                let _lock = LockGuard::acquire(&paths.lock_file)?;
-                if !port_is_open() && ProfileStore::load(&paths.store_file)?.active.is_some() {
-                    child = Some(start_background(paths, &executable)?);
-                }
-                Ok(())
-            })()
-        };
+        let result = (|| -> Result<bool> {
+            let _lock = LockGuard::acquire(&paths.lock_file)?;
+            let store = ProfileStore::load(&paths.store_file)?;
+            if store.mode == ProviderMode::Gpt {
+                return Ok(false);
+            }
+            if !port_is_open() && store.active.is_some() {
+                child = Some(start_background(paths, &executable)?);
+            }
+            Ok(true)
+        })();
         match result {
-            Ok(()) => retry_delay = Duration::from_secs(2),
+            Ok(false) => return Ok(()),
+            Ok(true) => retry_delay = Duration::from_secs(2),
             Err(error) => {
                 log_error(paths, &error);
                 retry_delay = (retry_delay * 2).min(Duration::from_secs(30));
@@ -457,7 +467,7 @@ mod tests {
     use super::{forward, target_url};
     use crate::atomic::{FileSensitivity, FileWriter, RealFileWriter};
     use crate::paths::AppPaths;
-    use crate::profile::{Profile, ProfileStore};
+    use crate::profile::{Profile, ProfileStore, ProviderMode};
 
     #[test]
     fn joins_root_and_versioned_base_urls() {
@@ -503,6 +513,7 @@ mod tests {
         let paths = AppPaths::isolated(temp.path());
         let store = ProfileStore {
             version: 1,
+            mode: ProviderMode::Relay,
             active: Some("relay".into()),
             profiles: BTreeMap::from([(
                 "relay".into(),

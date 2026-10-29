@@ -8,7 +8,7 @@ use crate::atomic::{FileSensitivity, FileWriter, ensure_private_dir};
 use crate::cli::Action;
 use crate::codex;
 use crate::paths::AppPaths;
-use crate::profile::{Profile, ProfileStore};
+use crate::profile::{Profile, ProfileStore, ProviderMode};
 use crate::relay::{self, RelayManager};
 use crate::validation::{validate_api_key, validate_base_url, validate_name};
 
@@ -44,18 +44,27 @@ impl<W: FileWriter, R: RelayManager> App<W, R> {
                 api_key,
                 force,
             } => self.add(name, base_url, api_key, force),
+            Action::Gpt => self.activate(ActivationTarget::Gpt),
             Action::List => self.list(),
+            Action::Status => self.status(),
             Action::Current => self.current(),
             Action::Remove { name, force } => self.remove(name, force),
-            Action::Activate { name } => self.activate(name),
+            Action::Activate { name } => self.activate(ActivationTarget::Profile(name)),
             Action::Resume => {
-                let name = ProfileStore::load(&self.paths.store_file)?
-                    .active
-                    .context("no previous profile; run 'cs <name>' once to choose a default")?;
-                self.activate(name)
+                let store = ProfileStore::load(&self.paths.store_file)?;
+                let target = match store.mode {
+                    ProviderMode::Gpt => ActivationTarget::Gpt,
+                    ProviderMode::Relay => ActivationTarget::Profile(store.active.context(
+                        "no previous profile; run 'cs <name>' or 'cs gpt' once to choose a default",
+                    )?),
+                };
+                self.activate(target)
             }
             Action::RelayInstall => {
-                if ProfileStore::load(&self.paths.store_file)?.active.is_some() {
+                let store = ProfileStore::load(&self.paths.store_file)?;
+                if store.mode == ProviderMode::Gpt {
+                    self.relay.stop()?;
+                } else if store.active.is_some() {
                     self.relay.restart(&self.paths)?;
                 }
                 Ok(String::new())
@@ -88,10 +97,25 @@ impl<W: FileWriter, R: RelayManager> App<W, R> {
 
     fn list(&self) -> Result<String> {
         let store = ProfileStore::load(&self.paths.store_file)?;
-        if store.profiles.is_empty() {
-            return Ok("No profiles saved.".into());
-        }
         let active = self.verified_active(&store)?;
+        Ok(Self::format_profiles(&store, active))
+    }
+
+    fn status(&self) -> Result<String> {
+        let store = ProfileStore::load(&self.paths.store_file)?;
+        let active = self.verified_active(&store)?;
+        Ok(format!(
+            "Current provider: {}\n\n{}",
+            active.unwrap_or("unmanaged"),
+            Self::format_profiles(&store, active)
+        ))
+    }
+
+    fn format_profiles(store: &ProfileStore, active: Option<&str>) -> String {
+        let active = active.filter(|_| store.mode == ProviderMode::Relay);
+        if store.profiles.is_empty() {
+            return "No profiles saved.".into();
+        }
         let width = store
             .profiles
             .keys()
@@ -119,7 +143,7 @@ impl<W: FileWriter, R: RelayManager> App<W, R> {
                 width = width
             ));
         }
-        Ok(lines.join("\n"))
+        lines.join("\n")
     }
 
     fn current(&self) -> Result<String> {
@@ -145,26 +169,34 @@ impl<W: FileWriter, R: RelayManager> App<W, R> {
         Ok(format!("Removed profile '{name}'."))
     }
 
-    fn activate(&self, name: String) -> Result<String> {
+    fn activate(&self, target: ActivationTarget) -> Result<String> {
         let mut machine = SwitchMachine::new();
-        validate_name(&name)?;
-
         let mut store = ProfileStore::load(&self.paths.store_file)?;
         machine.transition(SwitchPhase::Loaded);
-        let profile = store
-            .profiles
-            .get(&name)
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("profile '{name}' does not exist"))?;
-        validate_base_url(&profile.base_url)?;
-        validate_api_key(&profile.api_key)?;
+        let mode = match &target {
+            ActivationTarget::Profile(name) => {
+                validate_name(name)?;
+                let profile = store
+                    .profiles
+                    .get(name)
+                    .ok_or_else(|| anyhow::anyhow!("profile '{name}' does not exist"))?;
+                validate_base_url(&profile.base_url)?;
+                validate_api_key(&profile.api_key)?;
+                ProviderMode::Relay
+            }
+            ActivationTarget::Gpt => ProviderMode::Gpt,
+        };
         machine.transition(SwitchPhase::Validated);
 
         ensure_private_dir(&self.paths.codex_home)?;
         let original_config = read_optional(&self.paths.config_file)?;
         let original_store = read_optional(&self.paths.store_file)?;
-        let prepared_config = codex::prepare(original_config.as_deref())?;
-        store.active = Some(name.clone());
+        let prepared_config = codex::prepare(original_config.as_deref(), mode)?;
+        store.mode = mode;
+        store.active = match &target {
+            ActivationTarget::Profile(name) => Some(name.clone()),
+            ActivationTarget::Gpt => None,
+        };
         let active_store = store.encode()?;
         machine.transition(SwitchPhase::Staged);
 
@@ -186,13 +218,16 @@ impl<W: FileWriter, R: RelayManager> App<W, R> {
             machine.transition(SwitchPhase::ConfigWritten);
 
             machine.transition(SwitchPhase::Verifying);
-            if !codex::file_matches(&self.paths.config_file)? {
-                bail!("Codex config did not match the relay configuration after writing");
+            if !codex::file_matches(&self.paths.config_file, mode)? {
+                bail!("Codex config did not match the selected provider mode after writing");
             }
             machine.transition(SwitchPhase::Verified);
 
-            machine.transition(SwitchPhase::RestartingRelay);
-            self.relay.restart(&self.paths)?;
+            machine.transition(SwitchPhase::UpdatingRelay);
+            match mode {
+                ProviderMode::Relay => self.relay.restart(&self.paths)?,
+                ProviderMode::Gpt => self.relay.stop()?,
+            }
             machine.transition(SwitchPhase::RelayReady);
             machine.transition(SwitchPhase::Done);
             Ok(())
@@ -214,9 +249,12 @@ impl<W: FileWriter, R: RelayManager> App<W, R> {
                 .with_context(|| format!("switch failed during {:?}", machine.phase()));
         }
 
-        Ok(format!(
-            "Activated profile '{name}'. Codex auth.json was left unchanged; restart Codex to use the relay."
-        ))
+        Ok(match target {
+            ActivationTarget::Profile(name) => format!(
+                "Activated profile '{name}'. Codex auth.json was left unchanged; restart Codex to use the relay."
+            ),
+            ActivationTarget::Gpt => "Activated gpt mode (official OpenAI provider, no switch relay). Codex auth.json was left unchanged; restart Codex to connect directly.".into(),
+        })
     }
 
     fn rollback(&self, config: Option<&[u8]>, store: Option<&[u8]>) -> Vec<String> {
@@ -245,18 +283,25 @@ impl<W: FileWriter, R: RelayManager> App<W, R> {
     }
 
     fn verified_active<'a>(&self, store: &'a ProfileStore) -> Result<Option<&'a str>> {
+        if !codex::file_matches(&self.paths.config_file, store.mode)? {
+            return Ok(None);
+        }
+        if store.mode == ProviderMode::Gpt {
+            return Ok(Some("gpt"));
+        }
         let Some(name) = store.active.as_deref() else {
             return Ok(None);
         };
         if !store.profiles.contains_key(name) {
             return Ok(None);
         }
-        if codex::file_matches(&self.paths.config_file)? {
-            Ok(Some(name))
-        } else {
-            Ok(None)
-        }
+        Ok(Some(name))
     }
+}
+
+enum ActivationTarget {
+    Profile(String),
+    Gpt,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -271,7 +316,7 @@ enum SwitchPhase {
     ConfigWritten,
     Verifying,
     Verified,
-    RestartingRelay,
+    UpdatingRelay,
     RelayReady,
     Done,
 }
@@ -363,14 +408,23 @@ mod tests {
     use crate::atomic::{FileSensitivity, FileWriter, RealFileWriter};
     use crate::cli::Action;
     use crate::paths::AppPaths;
-    use crate::profile::ProfileStore;
+    use crate::profile::{ProfileStore, ProviderMode};
     use crate::relay::RelayManager;
 
-    #[derive(Clone, Copy)]
-    struct TestRelay;
+    #[derive(Default)]
+    struct TestRelay {
+        restarts: AtomicUsize,
+        stops: AtomicUsize,
+    }
 
     impl RelayManager for TestRelay {
         fn restart(&self, _paths: &AppPaths) -> Result<()> {
+            self.restarts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn stop(&self) -> Result<()> {
+            self.stops.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -388,7 +442,7 @@ mod tests {
     fn supports_profile_lifecycle_and_detects_external_edits() {
         let temp = tempdir().unwrap();
         let paths = AppPaths::isolated(temp.path());
-        let app = App::new(paths.clone(), RealFileWriter, TestRelay);
+        let app = App::new(paths.clone(), RealFileWriter, TestRelay::default());
 
         let added = app.execute(add_action()).unwrap();
         assert!(!added.contains("secret-key"));
@@ -410,7 +464,7 @@ mod tests {
     fn duplicate_and_active_removal_require_force() {
         let temp = tempdir().unwrap();
         let paths = AppPaths::isolated(temp.path());
-        let app = App::new(paths, RealFileWriter, TestRelay);
+        let app = App::new(paths, RealFileWriter, TestRelay::default());
         app.execute(add_action()).unwrap();
         assert!(app.execute(add_action()).is_err());
         app.execute(Action::Activate {
@@ -432,60 +486,94 @@ mod tests {
     }
 
     #[test]
-    fn rolls_back_when_config_or_active_store_writes_fail() {
-        for fail_on in 1..=2 {
-            let temp = tempdir().unwrap();
-            let paths = AppPaths::isolated(temp.path());
-            let setup = App::new(paths.clone(), RealFileWriter, TestRelay);
-            setup.execute(add_action()).unwrap();
-            fs::create_dir_all(&paths.codex_home).unwrap();
-            fs::write(&paths.config_file, b"model = \"original\"\n").unwrap();
-            let auth_file = paths.codex_home.join("auth.json");
-            fs::write(&auth_file, b"{\"original\":true}\n").unwrap();
-            let original_store = fs::read(&paths.store_file).unwrap();
+    fn gpt_uses_stop_and_resume_without_starting_a_relay() {
+        let temp = tempdir().unwrap();
+        let paths = AppPaths::isolated(temp.path());
+        let app = App::new(paths.clone(), RealFileWriter, TestRelay::default());
+        app.execute(Action::Gpt).unwrap();
+        app.execute(Action::Resume).unwrap();
+        app.execute(Action::RelayInstall).unwrap();
+        assert_eq!(app.relay.stops.load(Ordering::SeqCst), 3);
+        assert_eq!(app.relay.restarts.load(Ordering::SeqCst), 0);
+        assert_eq!(app.execute(Action::Current).unwrap(), "gpt");
+        assert_eq!(
+            ProfileStore::load(&paths.store_file).unwrap().mode,
+            ProviderMode::Gpt
+        );
+        assert!(!paths.codex_home.join("auth.json").exists());
 
-            let app = App::new(paths.clone(), FaultWriter::fail_before(fail_on), TestRelay);
-            assert!(
-                app.execute(Action::Activate {
-                    name: "work".into()
-                })
-                .is_err()
-            );
-            assert_eq!(
-                fs::read(&paths.config_file).unwrap(),
-                b"model = \"original\"\n"
-            );
-            assert_eq!(fs::read(&auth_file).unwrap(), b"{\"original\":true}\n");
-            assert_eq!(fs::read(&paths.store_file).unwrap(), original_store);
-            assert!(
-                ProfileStore::load(&paths.store_file)
-                    .unwrap()
-                    .active
-                    .is_none()
-            );
+        app.execute(add_action()).unwrap();
+        app.execute(Action::Activate {
+            name: "work".into(),
+        })
+        .unwrap();
+        assert_eq!(app.relay.restarts.load(Ordering::SeqCst), 1);
+        assert_eq!(app.execute(Action::Current).unwrap(), "work");
+    }
+
+    #[test]
+    fn rolls_back_write_failures_and_verification_corruption_in_either_mode() {
+        for gpt in [false, true] {
+            for fault in [
+                Fault::FailBefore(1),
+                Fault::FailBefore(2),
+                Fault::Corrupt(2),
+            ] {
+                let temp = tempdir().unwrap();
+                let paths = AppPaths::isolated(temp.path());
+                let setup = App::new(paths.clone(), RealFileWriter, TestRelay::default());
+                setup.execute(add_action()).unwrap();
+                setup.execute(activation(!gpt)).unwrap();
+                let auth_file = paths.codex_home.join("auth.json");
+                fs::write(&auth_file, b"{\"original\":true}\n").unwrap();
+                let original_config = fs::read(&paths.config_file).unwrap();
+                let original_store = fs::read(&paths.store_file).unwrap();
+                let app = App::new(paths.clone(), FaultWriter::new(fault), TestRelay::default());
+                assert!(app.execute(activation(gpt)).is_err());
+                assert_eq!(fs::read(&paths.config_file).unwrap(), original_config);
+                assert_eq!(fs::read(&paths.store_file).unwrap(), original_store);
+                assert_eq!(fs::read(&auth_file).unwrap(), b"{\"original\":true}\n");
+                assert_eq!(app.relay.restarts.load(Ordering::SeqCst), 0);
+                assert_eq!(app.relay.stops.load(Ordering::SeqCst), 0);
+            }
         }
     }
 
     #[test]
-    fn rolls_back_when_verification_detects_corruption() {
-        let temp = tempdir().unwrap();
-        let paths = AppPaths::isolated(temp.path());
-        let setup = App::new(paths.clone(), RealFileWriter, TestRelay);
-        setup.execute(add_action()).unwrap();
-        fs::create_dir_all(&paths.codex_home).unwrap();
-        fs::write(&paths.config_file, b"# original\n").unwrap();
-        let auth_file = paths.codex_home.join("auth.json");
-        fs::write(&auth_file, b"{}\n").unwrap();
+    fn rolls_back_when_relay_restart_or_stop_fails() {
+        struct FailingRelay;
+        impl RelayManager for FailingRelay {
+            fn restart(&self, _paths: &AppPaths) -> Result<()> {
+                bail!("injected restart failure")
+            }
+            fn stop(&self) -> Result<()> {
+                bail!("injected stop failure")
+            }
+        }
+        for gpt in [false, true] {
+            let temp = tempdir().unwrap();
+            let paths = AppPaths::isolated(temp.path());
+            let setup = App::new(paths.clone(), RealFileWriter, TestRelay::default());
+            setup.execute(add_action()).unwrap();
+            setup.execute(activation(!gpt)).unwrap();
+            let original_config = fs::read(&paths.config_file).unwrap();
+            let original_store = fs::read(&paths.store_file).unwrap();
+            let app = App::new(paths.clone(), RealFileWriter, FailingRelay);
+            let error = app.execute(activation(gpt)).unwrap_err();
+            assert!(error.to_string().contains("UpdatingRelay"));
+            assert_eq!(fs::read(&paths.config_file).unwrap(), original_config);
+            assert_eq!(fs::read(&paths.store_file).unwrap(), original_store);
+        }
+    }
 
-        let app = App::new(paths.clone(), FaultWriter::corrupt(2), TestRelay);
-        assert!(
-            app.execute(Action::Activate {
-                name: "work".into()
-            })
-            .is_err()
-        );
-        assert_eq!(fs::read(&paths.config_file).unwrap(), b"# original\n");
-        assert_eq!(fs::read(&auth_file).unwrap(), b"{}\n");
+    fn activation(gpt: bool) -> Action {
+        if gpt {
+            Action::Gpt
+        } else {
+            Action::Activate {
+                name: "work".into(),
+            }
+        }
     }
 
     enum Fault {
@@ -499,17 +587,10 @@ mod tests {
     }
 
     impl FaultWriter {
-        fn fail_before(write: usize) -> Self {
+        fn new(fault: Fault) -> Self {
             Self {
                 writes: AtomicUsize::new(0),
-                fault: Fault::FailBefore(write),
-            }
-        }
-
-        fn corrupt(write: usize) -> Self {
-            Self {
-                writes: AtomicUsize::new(0),
-                fault: Fault::Corrupt(write),
+                fault,
             }
         }
     }

@@ -15,9 +15,19 @@ pub struct Profile {
     pub api_key: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderMode {
+    #[default]
+    Relay,
+    Gpt,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct ProfileStore {
     pub version: u32,
+    #[serde(default)]
+    pub mode: ProviderMode,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active: Option<String>,
     pub profiles: BTreeMap<String, Profile>,
@@ -27,6 +37,7 @@ impl Default for ProfileStore {
     fn default() -> Self {
         Self {
             version: STORE_VERSION,
+            mode: ProviderMode::Relay,
             active: None,
             profiles: BTreeMap::new(),
         }
@@ -76,12 +87,13 @@ impl ProfileStore {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{Profile, ProfileStore};
+    use super::{Profile, ProfileStore, ProviderMode};
 
     #[test]
     fn versioned_store_round_trips_special_key_characters() {
         let store = ProfileStore {
             version: 1,
+            mode: ProviderMode::Relay,
             active: Some("work".into()),
             profiles: BTreeMap::from([(
                 "work".into(),

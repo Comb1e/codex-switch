@@ -3,7 +3,7 @@
 use std::fs;
 use std::net::TcpListener;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -87,7 +87,7 @@ fn launcher(data_dir: &Path, unrelated_root: &Path, port: u16) -> Command {
 #[test]
 fn login_restores_saved_profile_without_a_terminal_and_recovers_worker_exit() {
     let temp = tempfile::tempdir().unwrap();
-    let data_dir = temp.path().join("saved profiles with spaces");
+    let data_dir = temp.path().join("saved profiles with spaces").join("cs");
     fs::create_dir_all(&data_dir).unwrap();
     let upstream = Server::http("127.0.0.1:0").unwrap();
     fs::write(data_dir.join("profiles.json"), serde_json::to_vec(&json!({
@@ -116,19 +116,7 @@ fn login_restores_saved_profile_without_a_terminal_and_recovers_worker_exit() {
 
     // Repeated login/activation launches must not create competing supervisors.
     let mut duplicate = launcher(&data_dir, &unrelated, port).spawn().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Some(status) = duplicate.try_wait().unwrap() {
-            assert!(status.success());
-            break;
-        }
-        if Instant::now() >= deadline {
-            let _ = duplicate.kill();
-            let _ = duplicate.wait();
-            panic!("duplicate supervisor did not exit");
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
+    assert!(wait_exit(&mut duplicate).success());
     assert_eq!(relay.health_pid(), Some(original_pid));
 
     let (request_started_tx, request_started_rx) = std::sync::mpsc::channel();
@@ -186,7 +174,49 @@ fn login_restores_saved_profile_without_a_terminal_and_recovers_worker_exit() {
     relay.wait_ready(Some(original_pid));
     forward(&relay);
     upstream_thread.join().unwrap();
+    // A real mode switch must stop the worker and let the supervisor exit.
+    let switched = Command::new(env!("CARGO_BIN_EXE_cs"))
+        .arg("gpt")
+        .env("CS_TEST_RELAY_PORT", port.to_string())
+        .env_remove("CS_TEST_SKIP_RELAY_START")
+        .env("LOCALAPPDATA", data_dir.parent().unwrap())
+        .env("XDG_CONFIG_HOME", data_dir.parent().unwrap())
+        .env("CODEX_HOME", unrelated.join("codex"))
+        .output()
+        .unwrap();
+    assert!(
+        switched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&switched.stderr)
+    );
+    assert!(wait_exit(&mut relay.supervisor).success());
+    assert_eq!(relay.health_pid(), None);
+    let store: Value =
+        serde_json::from_slice(&fs::read(data_dir.join("profiles.json")).unwrap()).unwrap();
+    assert_eq!(store["mode"], "gpt");
+    assert!(store.get("active").is_none());
+    assert_eq!(store["profiles"]["last"]["api_key"], "last-key");
+
+    // A new login after selecting GPT must also exit without a worker.
+    let mut direct_login = launcher(&data_dir, &unrelated, port).spawn().unwrap();
+    assert!(wait_exit(&mut direct_login).success());
+    assert_eq!(relay.health_pid(), None);
     assert!(!unrelated.join("cs/profiles.json").exists());
+}
+
+fn wait_exit(child: &mut Child) -> ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("supervisor did not exit");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 #[cfg(windows)]
